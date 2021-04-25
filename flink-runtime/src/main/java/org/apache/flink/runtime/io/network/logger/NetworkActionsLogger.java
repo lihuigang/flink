@@ -18,51 +18,109 @@
 
 package org.apache.flink.runtime.io.network.logger;
 
+import org.apache.flink.runtime.checkpoint.channel.InputChannelInfo;
+import org.apache.flink.runtime.checkpoint.channel.ResultSubpartitionInfo;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
+import org.apache.flink.runtime.io.network.partition.consumer.ChannelStatePersister;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Arrays;
+import java.io.Closeable;
 
-import static org.apache.flink.util.Preconditions.checkState;
-
-/** Utility class for logging actions that happened in the network stack for debugging purposes. */
+/**
+ * Utility class for logging actions that happened in the network stack for debugging purposes.
+ *
+ * <p>Action parameter typically includes class and method names.
+ */
 public class NetworkActionsLogger {
     private static final Logger LOG = LoggerFactory.getLogger(NetworkActionsLogger.class);
-
-    private static final boolean ENABLED = LOG.isTraceEnabled();
     private static final boolean INCLUDE_HASH = true;
 
-    public static void log(Class<?> clazz, String action, Buffer buffer) {
-        if (ENABLED) {
-            LOG.trace("{}#{} buffer = [{}]", clazz.getSimpleName(), action, toPrettyString(buffer));
+    public static void traceInput(
+            String action,
+            Buffer buffer,
+            String taskName,
+            InputChannelInfo channelInfo,
+            ChannelStatePersister channelStatePersister,
+            int sequenceNumber) {
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(
+                    "[{}] {} {}, seq {}, {} @ {}",
+                    taskName,
+                    action,
+                    buffer.toDebugString(INCLUDE_HASH),
+                    sequenceNumber,
+                    channelStatePersister,
+                    channelInfo);
         }
     }
 
-    public static void log(Class<?> clazz, String action, BufferConsumer bufferConsumer) {
-        if (ENABLED) {
-            Buffer buffer = null;
-            try (BufferConsumer copiedBufferConsumer = bufferConsumer.copy()) {
-                buffer = copiedBufferConsumer.build();
-                log(clazz, action, buffer);
-                checkState(copiedBufferConsumer.isFinished());
-            } finally {
-                if (buffer != null) {
-                    buffer.recycleBuffer();
-                }
+    public static void traceOutput(
+            String action, Buffer buffer, String taskName, ResultSubpartitionInfo channelInfo) {
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(
+                    "[{}] {} {} @ {}",
+                    taskName,
+                    action,
+                    buffer.toDebugString(INCLUDE_HASH),
+                    channelInfo);
+        }
+    }
+
+    public static void traceRecover(
+            String action, Buffer buffer, String taskName, InputChannelInfo channelInfo) {
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(
+                    "[{}] {} {} @ {}",
+                    taskName,
+                    action,
+                    buffer.toDebugString(INCLUDE_HASH),
+                    channelInfo);
+        }
+    }
+
+    public static void traceRecover(
+            String action, BufferConsumer bufferConsumer, ResultSubpartitionInfo channelInfo) {
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(
+                    "{} {} @ {}", action, bufferConsumer.toDebugString(INCLUDE_HASH), channelInfo);
+        }
+    }
+
+    public static void tracePersist(
+            String action, Buffer buffer, Object channelInfo, long checkpointId) {
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(
+                    "{} {}, checkpoint {} @ {}",
+                    action,
+                    buffer.toDebugString(INCLUDE_HASH),
+                    checkpointId,
+                    channelInfo);
+        }
+    }
+
+    private static final long MAX_EXPECTED_IO_TIME_IN_MS = 100L;
+
+    public static Closeable measureIO(String action, Object entity) {
+        if (!LOG.isDebugEnabled()) {
+            // seems to be completely inlined by JIT
+            return NO_MEASURE;
+        }
+        // adds around 100ns in a try-with-resource statement on a i7-9750H CPU @ 2.60GHz
+        long startTime = System.currentTimeMillis();
+        return () -> {
+            long elapsedTime = System.currentTimeMillis() - startTime;
+            if (elapsedTime > MAX_EXPECTED_IO_TIME_IN_MS) {
+                LOG.debug(
+                        "{} {} took unexpected long ({} ms) indicating that the checkpoint storage is overloaded.",
+                        action,
+                        entity,
+                        elapsedTime);
             }
-        }
+        };
     }
 
-    private static String toPrettyString(Buffer buffer) {
-        StringBuilder prettyString = new StringBuilder("size=").append(buffer.getSize());
-        if (INCLUDE_HASH) {
-            byte[] bytes = new byte[buffer.getSize()];
-            buffer.readOnlySlice().asByteBuf().readBytes(bytes);
-            prettyString.append(", hash=").append(Arrays.hashCode(bytes));
-        }
-        return prettyString.toString();
-    }
+    private static final Closeable NO_MEASURE = () -> {};
 }

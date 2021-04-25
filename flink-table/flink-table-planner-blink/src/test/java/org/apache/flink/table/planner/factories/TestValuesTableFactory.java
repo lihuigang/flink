@@ -31,6 +31,7 @@ import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.streaming.api.functions.source.FromElementsFunction;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.api.ValidationException;
@@ -57,6 +58,7 @@ import org.apache.flink.table.connector.source.abilities.SupportsLimitPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsPartitionPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsReadingMetadata;
+import org.apache.flink.table.connector.source.abilities.SupportsSourceWatermark;
 import org.apache.flink.table.connector.source.abilities.SupportsWatermarkPushDown;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.expressions.ResolvedExpression;
@@ -71,6 +73,7 @@ import org.apache.flink.table.planner.factories.TestValuesRuntimeFunctions.Async
 import org.apache.flink.table.planner.factories.TestValuesRuntimeFunctions.KeyedUpsertingSinkFunction;
 import org.apache.flink.table.planner.factories.TestValuesRuntimeFunctions.RetractingSinkFunction;
 import org.apache.flink.table.planner.factories.TestValuesRuntimeFunctions.TestValuesLookupFunction;
+import org.apache.flink.table.planner.runtime.utils.FailingCollectionSource;
 import org.apache.flink.table.planner.utils.FilterUtils;
 import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
 import org.apache.flink.table.types.DataType;
@@ -218,6 +221,9 @@ public final class TestValuesTableFactory
                     .stringType()
                     .defaultValue("SourceFunction"); // another is "InputFormat"
 
+    private static final ConfigOption<Boolean> FAILING_SOURCE =
+            ConfigOptions.key("failing-source").booleanType().defaultValue(false);
+
     private static final ConfigOption<String> RUNTIME_SINK =
             ConfigOptions.key("runtime-sink")
                     .stringType()
@@ -278,6 +284,11 @@ public final class TestValuesTableFactory
                     .booleanType()
                     .defaultValue(false)
                     .withDeprecatedKeys("Option to determine whether to discard the late event.");
+    private static final ConfigOption<Integer> SOURCE_NUM_ELEMENT_TO_SKIP =
+            ConfigOptions.key("source.num-element-to-skip")
+                    .intType()
+                    .defaultValue(-1)
+                    .withDeprecatedKeys("Option to define the number of elements to skip.");
 
     /**
      * Parse partition list from Options with the format as
@@ -312,6 +323,8 @@ public final class TestValuesTableFactory
         boolean disableLookup = helper.getOptions().get(DISABLE_LOOKUP);
         boolean nestedProjectionSupported = helper.getOptions().get(NESTED_PROJECTION_SUPPORTED);
         boolean enableWatermarkPushDown = helper.getOptions().get(ENABLE_WATERMARK_PUSH_DOWN);
+        boolean failingSource = helper.getOptions().get(FAILING_SOURCE);
+        int numElementToSkip = helper.getOptions().get(SOURCE_NUM_ELEMENT_TO_SKIP);
 
         Optional<List<String>> filterableFields =
                 helper.getOptions().getOptional(FILTERABLE_FIELDS);
@@ -346,12 +359,14 @@ public final class TestValuesTableFactory
                             producedDataType,
                             changelogMode,
                             runtimeSource,
+                            failingSource,
                             partition2Rows,
                             context.getObjectIdentifier().getObjectName(),
                             nestedProjectionSupported,
                             null,
                             Collections.emptyList(),
                             filterableFieldsSet,
+                            numElementToSkip,
                             Long.MAX_VALUE,
                             partitions,
                             readableMetadata,
@@ -362,11 +377,13 @@ public final class TestValuesTableFactory
                             changelogMode,
                             isBounded,
                             runtimeSource,
+                            failingSource,
                             partition2Rows,
                             nestedProjectionSupported,
                             null,
                             Collections.emptyList(),
                             filterableFieldsSet,
+                            numElementToSkip,
                             Long.MAX_VALUE,
                             partitions,
                             readableMetadata,
@@ -378,6 +395,7 @@ public final class TestValuesTableFactory
                         changelogMode,
                         isBounded,
                         runtimeSource,
+                        failingSource,
                         partition2Rows,
                         isAsync,
                         lookupFunctionClass,
@@ -385,6 +403,7 @@ public final class TestValuesTableFactory
                         null,
                         Collections.emptyList(),
                         filterableFieldsSet,
+                        numElementToSkip,
                         Long.MAX_VALUE,
                         partitions,
                         readableMetadata,
@@ -468,6 +487,7 @@ public final class TestValuesTableFactory
                         BOUNDED,
                         RUNTIME_SOURCE,
                         TABLE_SOURCE_CLASS,
+                        FAILING_SOURCE,
                         LOOKUP_FUNCTION_CLASS,
                         ASYNC_ENABLED,
                         DISABLE_LOOKUP,
@@ -484,7 +504,8 @@ public final class TestValuesTableFactory
                         SINK_CHANGELOG_MODE_ENFORCED,
                         WRITABLE_METADATA,
                         ENABLE_WATERMARK_PUSH_DOWN,
-                        SINK_DROP_LATE_EVENT));
+                        SINK_DROP_LATE_EVENT,
+                        SOURCE_NUM_ELEMENT_TO_SKIP));
     }
 
     private static int validateAndExtractRowtimeIndex(
@@ -625,6 +646,7 @@ public final class TestValuesTableFactory
         protected final ChangelogMode changelogMode;
         protected final boolean bounded;
         protected final String runtimeSource;
+        protected final boolean failingSource;
         protected Map<Map<String, String>, Collection<Row>> data;
 
         protected final boolean nestedProjectionSupported;
@@ -632,6 +654,7 @@ public final class TestValuesTableFactory
         protected List<ResolvedExpression> filterPredicates;
         protected final Set<String> filterableFields;
         protected long limit;
+        protected int numElementToSkip;
         protected List<Map<String, String>> allPartitions;
         protected final Map<String, DataType> readableMetadata;
         protected @Nullable int[] projectedMetadataFields;
@@ -641,11 +664,13 @@ public final class TestValuesTableFactory
                 ChangelogMode changelogMode,
                 boolean bounded,
                 String runtimeSource,
+                boolean failingSource,
                 Map<Map<String, String>, Collection<Row>> data,
                 boolean nestedProjectionSupported,
                 @Nullable int[][] projectedPhysicalFields,
                 List<ResolvedExpression> filterPredicates,
                 Set<String> filterableFields,
+                int numElementToSkip,
                 long limit,
                 List<Map<String, String>> allPartitions,
                 Map<String, DataType> readableMetadata,
@@ -654,11 +679,13 @@ public final class TestValuesTableFactory
             this.changelogMode = changelogMode;
             this.bounded = bounded;
             this.runtimeSource = runtimeSource;
+            this.failingSource = failingSource;
             this.data = data;
             this.nestedProjectionSupported = nestedProjectionSupported;
             this.projectedPhysicalFields = projectedPhysicalFields;
             this.filterPredicates = filterPredicates;
             this.filterableFields = filterableFields;
+            this.numElementToSkip = numElementToSkip;
             this.limit = limit;
             this.allPartitions = allPartitions;
             this.readableMetadata = readableMetadata;
@@ -684,14 +711,27 @@ public final class TestValuesTableFactory
             switch (runtimeSource) {
                 case "SourceFunction":
                     try {
-                        return SourceFunctionProvider.of(
-                                new FromElementsFunction<>(serializer, values), bounded);
+                        final SourceFunction<RowData> sourceFunction;
+                        if (failingSource) {
+                            sourceFunction =
+                                    new FailingCollectionSource<>(
+                                            serializer, values, values.size() / 2);
+                        } else {
+                            sourceFunction = new FromElementsFunction<>(serializer, values);
+                        }
+                        return SourceFunctionProvider.of(sourceFunction, bounded);
                     } catch (IOException e) {
                         throw new TableException("Fail to init source function", e);
                     }
                 case "InputFormat":
+                    checkArgument(
+                            !failingSource,
+                            "Values InputFormat Source doesn't support as failing source.");
                     return InputFormatProvider.of(new CollectionInputFormat<>(values, serializer));
                 case "DataStream":
+                    checkArgument(
+                            !failingSource,
+                            "Values DataStream Source doesn't support as failing source.");
                     try {
                         FromElementsFunction<RowData> function =
                                 new FromElementsFunction<>(serializer, values);
@@ -699,7 +739,7 @@ public final class TestValuesTableFactory
                             @Override
                             public DataStream<RowData> produceDataStream(
                                     StreamExecutionEnvironment execEnv) {
-                                return execEnv.addSource(function, type);
+                                return execEnv.addSource(function);
                             }
 
                             @Override
@@ -757,11 +797,13 @@ public final class TestValuesTableFactory
                     changelogMode,
                     bounded,
                     runtimeSource,
+                    failingSource,
                     data,
                     nestedProjectionSupported,
                     projectedPhysicalFields,
                     filterPredicates,
                     filterableFields,
+                    numElementToSkip,
                     limit,
                     allPartitions,
                     readableMetadata,
@@ -779,6 +821,7 @@ public final class TestValuesTableFactory
                     allPartitions.isEmpty()
                             ? Collections.singletonList(Collections.emptyMap())
                             : allPartitions;
+            int numRetained = 0;
             for (Map<String, String> partition : keys) {
                 for (Row row : data.get(partition)) {
                     if (result.size() >= limit) {
@@ -791,8 +834,11 @@ public final class TestValuesTableFactory
                         final Row projectedRow = projectRow(row);
                         final RowData rowData = (RowData) converter.toInternal(projectedRow);
                         if (rowData != null) {
-                            rowData.setRowKind(row.getKind());
-                            result.add(rowData);
+                            if (numRetained >= numElementToSkip) {
+                                rowData.setRowKind(row.getKind());
+                                result.add(rowData);
+                            }
+                            numRetained++;
                         }
                     }
                 }
@@ -883,7 +929,8 @@ public final class TestValuesTableFactory
 
     /** Values {@link ScanTableSource} for testing that supports watermark push down. */
     private static class TestValuesScanTableSourceWithWatermarkPushDown
-            extends TestValuesScanTableSource implements SupportsWatermarkPushDown {
+            extends TestValuesScanTableSource
+            implements SupportsWatermarkPushDown, SupportsSourceWatermark {
         private final String tableName;
 
         private WatermarkStrategy<RowData> watermarkStrategy;
@@ -892,12 +939,14 @@ public final class TestValuesTableFactory
                 DataType producedDataType,
                 ChangelogMode changelogMode,
                 String runtimeSource,
+                boolean failingSource,
                 Map<Map<String, String>, Collection<Row>> data,
                 String tableName,
                 boolean nestedProjectionSupported,
                 @Nullable int[][] projectedPhysicalFields,
                 List<ResolvedExpression> filterPredicates,
                 Set<String> filterableFields,
+                int numElementToSkip,
                 long limit,
                 List<Map<String, String>> allPartitions,
                 Map<String, DataType> readableMetadata,
@@ -907,11 +956,13 @@ public final class TestValuesTableFactory
                     changelogMode,
                     false,
                     runtimeSource,
+                    failingSource,
                     data,
                     nestedProjectionSupported,
                     projectedPhysicalFields,
                     filterPredicates,
                     filterableFields,
+                    numElementToSkip,
                     limit,
                     allPartitions,
                     readableMetadata,
@@ -922,6 +973,11 @@ public final class TestValuesTableFactory
         @Override
         public void applyWatermark(WatermarkStrategy<RowData> watermarkStrategy) {
             this.watermarkStrategy = watermarkStrategy;
+        }
+
+        @Override
+        public void applySourceWatermark() {
+            this.watermarkStrategy = WatermarkStrategy.noWatermarks();
         }
 
         @Override
@@ -951,12 +1007,14 @@ public final class TestValuesTableFactory
                             producedDataType,
                             changelogMode,
                             runtimeSource,
+                            failingSource,
                             data,
                             tableName,
                             nestedProjectionSupported,
                             projectedPhysicalFields,
                             filterPredicates,
                             filterableFields,
+                            numElementToSkip,
                             limit,
                             allPartitions,
                             readableMetadata,
@@ -983,6 +1041,7 @@ public final class TestValuesTableFactory
                 ChangelogMode changelogMode,
                 boolean bounded,
                 String runtimeSource,
+                boolean failingSource,
                 Map<Map<String, String>, Collection<Row>> data,
                 boolean isAsync,
                 @Nullable String lookupFunctionClass,
@@ -990,6 +1049,7 @@ public final class TestValuesTableFactory
                 int[][] projectedFields,
                 List<ResolvedExpression> filterPredicates,
                 Set<String> filterableFields,
+                int numElementToSkip,
                 long limit,
                 List<Map<String, String>> allPartitions,
                 Map<String, DataType> readableMetadata,
@@ -999,11 +1059,13 @@ public final class TestValuesTableFactory
                     changelogMode,
                     bounded,
                     runtimeSource,
+                    failingSource,
                     data,
                     nestedProjectionSupported,
                     projectedFields,
                     filterPredicates,
                     filterableFields,
+                    numElementToSkip,
                     limit,
                     allPartitions,
                     readableMetadata,
@@ -1041,7 +1103,17 @@ public final class TestValuesTableFactory
                 allPartitions.forEach(
                         key -> rows.addAll(data.getOrDefault(key, new ArrayList<>())));
             }
-            rows.forEach(
+
+            List<Row> data = new ArrayList<>(rows);
+            if (numElementToSkip > 0) {
+                if (numElementToSkip >= data.size()) {
+                    data = Collections.EMPTY_LIST;
+                } else {
+                    data = data.subList(numElementToSkip, data.size());
+                }
+            }
+
+            data.forEach(
                     record -> {
                         Row key =
                                 Row.of(
@@ -1062,6 +1134,28 @@ public final class TestValuesTableFactory
             } else {
                 return TableFunctionProvider.of(new TestValuesLookupFunction(mapping));
             }
+        }
+
+        @Override
+        public DynamicTableSource copy() {
+            return new TestValuesScanLookupTableSource(
+                    producedDataType,
+                    changelogMode,
+                    bounded,
+                    runtimeSource,
+                    failingSource,
+                    data,
+                    isAsync,
+                    lookupFunctionClass,
+                    nestedProjectionSupported,
+                    projectedPhysicalFields,
+                    filterPredicates,
+                    filterableFields,
+                    numElementToSkip,
+                    limit,
+                    allPartitions,
+                    readableMetadata,
+                    projectedMetadataFields);
         }
     }
 
@@ -1135,15 +1229,9 @@ public final class TestValuesTableFactory
             if (isInsertOnly) {
                 return ChangelogMode.insertOnly();
             } else {
-                ChangelogMode.Builder builder = ChangelogMode.newBuilder();
                 if (primaryKeyIndices.length > 0) {
                     // can update on key, ignore UPDATE_BEFORE
-                    for (RowKind kind : requestedMode.getContainedKinds()) {
-                        if (kind != RowKind.UPDATE_BEFORE) {
-                            builder.addContainedKind(kind);
-                        }
-                    }
-                    return builder.build();
+                    return ChangelogMode.upsert();
                 } else {
                     // don't have key, works in retract mode
                     return requestedMode;

@@ -33,7 +33,6 @@ import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferDecompressor;
 import org.apache.flink.runtime.io.network.buffer.BufferPool;
 import org.apache.flink.runtime.io.network.buffer.BufferProvider;
-import org.apache.flink.runtime.io.network.logger.NetworkActionsLogger;
 import org.apache.flink.runtime.io.network.partition.PartitionProducerStateProvider;
 import org.apache.flink.runtime.io.network.partition.PrioritizedDeque;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
@@ -297,6 +296,7 @@ public class SingleInputGate extends IndexedInputGate {
 
     @VisibleForTesting
     void convertRecoveredInputChannels() {
+        LOG.debug("Converting recovered input channels ({} channels)", getNumberOfInputChannels());
         for (Map.Entry<IntermediateResultPartitionID, InputChannel> entry :
                 inputChannels.entrySet()) {
             InputChannel inputChannel = entry.getValue();
@@ -653,8 +653,6 @@ public class SingleInputGate extends IndexedInputGate {
                     checkUnavailability();
                     continue;
                 }
-                NetworkActionsLogger.log(
-                        getClass(), "waitAndGetNextData", bufferAndAvailabilityOpt.get().buffer());
 
                 final BufferAndAvailability bufferAndAvailability = bufferAndAvailabilityOpt.get();
                 if (bufferAndAvailability.moreAvailable()) {
@@ -858,6 +856,12 @@ public class SingleInputGate extends IndexedInputGate {
                     // priority event at the given offset already polled (notification is not atomic
                     // in respect to
                     // buffer enqueuing), so just ignore the notification
+                    return;
+                }
+
+                if (channel.isReleased()) {
+                    // when channel is closed, EndOfPartitionEvent is send and a final notification
+                    // if EndOfPartitionEvent causes a release, we must ignore the notification
                     return;
                 }
 

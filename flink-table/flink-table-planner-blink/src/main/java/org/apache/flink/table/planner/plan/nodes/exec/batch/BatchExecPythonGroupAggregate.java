@@ -30,7 +30,9 @@ import org.apache.flink.table.functions.python.PythonFunctionInfo;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecEdge;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNode;
-import org.apache.flink.table.planner.plan.nodes.exec.common.CommonExecPythonAggregate;
+import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
+import org.apache.flink.table.planner.plan.nodes.exec.InputProperty;
+import org.apache.flink.table.planner.plan.nodes.exec.SingleTransformationTranslator;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.CommonPythonUtil;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.logical.RowType;
@@ -39,41 +41,43 @@ import org.apache.calcite.rel.core.AggregateCall;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
+import java.util.Collections;
 
-/** Batch [[ExecNode]] for Python unbounded group aggregate. */
-public class BatchExecPythonGroupAggregate extends CommonExecPythonAggregate
-        implements BatchExecNode<RowData> {
+/** Batch {@link ExecNode} for Python unbounded group aggregate. */
+public class BatchExecPythonGroupAggregate extends ExecNodeBase<RowData>
+        implements BatchExecNode<RowData>, SingleTransformationTranslator<RowData> {
 
     private static final String ARROW_PYTHON_AGGREGATE_FUNCTION_OPERATOR_NAME =
             "org.apache.flink.table.runtime.operators.python.aggregate.arrow.batch."
                     + "BatchArrowPythonGroupAggregateFunctionOperator";
 
     private final int[] grouping;
-    private final int[] groupingSet;
+    private final int[] auxGrouping;
     private final AggregateCall[] aggCalls;
 
     public BatchExecPythonGroupAggregate(
             int[] grouping,
-            int[] groupingSet,
+            int[] auxGrouping,
             AggregateCall[] aggCalls,
-            ExecEdge inputEdge,
+            InputProperty inputProperty,
             RowType outputType,
             String description) {
-        super(inputEdge, outputType, description);
+        super(Collections.singletonList(inputProperty), outputType, description);
         this.grouping = grouping;
-        this.groupingSet = groupingSet;
+        this.auxGrouping = auxGrouping;
         this.aggCalls = aggCalls;
     }
 
     @SuppressWarnings("unchecked")
     @Override
     protected Transformation<RowData> translateToPlanInternal(PlannerBase planner) {
-        final ExecNode<RowData> inputNode = (ExecNode<RowData>) getInputNodes().get(0);
-        final Transformation<RowData> inputTransform = inputNode.translateToPlan(planner);
-        final RowType inputRowType = (RowType) inputNode.getOutputType();
+        final ExecEdge inputEdge = getInputEdges().get(0);
+        final Transformation<RowData> inputTransform =
+                (Transformation<RowData>) inputEdge.translateToPlan(planner);
+        final RowType inputRowType = (RowType) inputEdge.getOutputType();
         final RowType outputRowType = InternalTypeInfo.of(getOutputType()).toRowType();
         Configuration config =
-                CommonPythonUtil.getConfig(planner.getExecEnv(), planner.getTableConfig());
+                CommonPythonUtil.getMergedConfig(planner.getExecEnv(), planner.getTableConfig());
         OneInputTransformation<RowData, RowData> transform =
                 createPythonOneInputTransformation(
                         inputTransform, inputRowType, outputRowType, config);
@@ -84,14 +88,13 @@ public class BatchExecPythonGroupAggregate extends CommonExecPythonAggregate
         return transform;
     }
 
-    @SuppressWarnings("unchecked")
     private OneInputTransformation<RowData, RowData> createPythonOneInputTransformation(
             Transformation<RowData> inputTransform,
             RowType inputRowType,
             RowType outputRowType,
             Configuration config) {
         final Tuple2<int[], PythonFunctionInfo[]> aggInfos =
-                extractPythonAggregateFunctionInfosFromAggregateCall(aggCalls);
+                CommonPythonUtil.extractPythonAggregateFunctionInfosFromAggregateCall(aggCalls);
         int[] pythonUdafInputOffsets = aggInfos.f0;
         PythonFunctionInfo[] pythonFunctionInfos = aggInfos.f1;
         OneInputStreamOperator<RowData, RowData> pythonOperator =
@@ -101,9 +104,9 @@ public class BatchExecPythonGroupAggregate extends CommonExecPythonAggregate
                         outputRowType,
                         pythonUdafInputOffsets,
                         pythonFunctionInfos);
-        return new OneInputTransformation(
+        return new OneInputTransformation<>(
                 inputTransform,
-                getDesc(),
+                getDescription(),
                 pythonOperator,
                 InternalTypeInfo.of(outputRowType),
                 inputTransform.getParallelism());
@@ -116,10 +119,10 @@ public class BatchExecPythonGroupAggregate extends CommonExecPythonAggregate
             RowType outputRowType,
             int[] udafInputOffsets,
             PythonFunctionInfo[] pythonFunctionInfos) {
-        final Class clazz =
+        final Class<?> clazz =
                 CommonPythonUtil.loadClass(ARROW_PYTHON_AGGREGATE_FUNCTION_OPERATOR_NAME);
         try {
-            Constructor ctor =
+            Constructor<?> ctor =
                     clazz.getConstructor(
                             Configuration.class,
                             PythonFunctionInfo[].class,
@@ -135,7 +138,7 @@ public class BatchExecPythonGroupAggregate extends CommonExecPythonAggregate
                             inputRowType,
                             outputRowType,
                             grouping,
-                            groupingSet,
+                            auxGrouping,
                             udafInputOffsets);
         } catch (NoSuchMethodException
                 | IllegalAccessException
